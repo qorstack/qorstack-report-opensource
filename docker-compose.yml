@@ -1,0 +1,154 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: qorstack-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=qorstack_report
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - qorstack-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:RELEASE.2025-02-28T09-55-16Z
+    container_name: qorstack-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ACCESS_KEY}
+      - MINIO_ROOT_PASSWORD=${MINIO_SECRET_KEY}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - qorstack-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Mirrors fonts from MinIO (system-fonts + fonts buckets) into the shared volume.
+  # Gotenberg mounts this volume so LibreOffice picks up fonts automatically.
+  font-syncer:
+    image: minio/mc:RELEASE.2025-02-15T09-49-59Z
+    container_name: qorstack-font-syncer
+    restart: unless-stopped
+    entrypoint: >
+      /bin/sh -c "
+        until mc alias set minio http://${MINIO_ENDPOINT:-qorstack-minio:9000} $$MINIO_ACCESS_KEY $$MINIO_SECRET_KEY 2>/dev/null; do
+          echo 'Waiting for MinIO...'; sleep 3;
+        done;
+        mc mb --ignore-existing minio/system-fonts;
+        mc mb --ignore-existing minio/fonts;
+        echo 'Starting font mirror...';
+        mc mirror --watch --overwrite minio/system-fonts /fonts-cache/ &
+        mc mirror --watch --overwrite minio/fonts /fonts-cache/
+      "
+    environment:
+      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
+      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+    volumes:
+      - fonts_cache:/fonts-cache
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - qorstack-network
+
+  gotenberg:
+    image: qorstack/gotenberg:8
+    container_name: qorstack-gotenberg
+    restart: unless-stopped
+    command:
+      - "gotenberg"
+      - "--api-port=3000"
+      - "--log-level=warn"
+      - "--libreoffice-auto-start=true"
+      - "--libreoffice-restart-after=100"
+      - "--api-disable-health-check-logging=true"
+    volumes:
+      - fonts_cache:/usr/local/share/fonts/custom
+    networks:
+      - qorstack-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  backend:
+    image: qorstack/report-api:latest
+    container_name: qorstack-report-api
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - Admin__Email=${ADMIN_EMAIL}
+      - Admin__Password=${ADMIN_PASSWORD}
+      - ConnectionStrings__DefaultConnection=Host=${DB_HOST:-qorstack-postgres};Port=${DB_PORT:-5432};Database=${DB_NAME:-qorstack_report};Username=${DB_USER:-postgres};Password=${DB_PASSWORD}
+      - Database__MigrationPaths__0=database
+      - Minio__Endpoint=${MINIO_ENDPOINT:-qorstack-minio:9000}
+      - Minio__PublicEndpoint=${MINIO_PUBLIC_ENDPOINT:-http://localhost:9000}
+      - Minio__AccessKey=${MINIO_ACCESS_KEY}
+      - Minio__SecretKey=${MINIO_SECRET_KEY}
+      - Minio__UseSsl=${MINIO_USE_SSL:-false}
+      - Minio__TemplateBucket=templates
+      - Minio__ReportBucket=reports
+      - Gotenberg__BaseUrl=http://qorstack-gotenberg:3000
+      - Jwt__Key=${JWT_KEY}
+      - Jwt__Issuer=qorstack-report
+      - Jwt__Audience=qorstack-report
+      - Encryption__Key=${ENCRYPTION_KEY}
+      - Encryption__IV=${ENCRYPTION_IV}
+      - Cors__AllowedOriginsString=${CORS_ORIGINS:-http://localhost:3000}
+      # --- Pro license (optional) ---
+      # - Pro__LicenseFile=/app/license.json
+    volumes:
+      - ./fonts:/app/fonts:ro  # optional: place .ttf/.otf files here to pre-load on startup
+      # - ./license.json:/app/license.json:ro  # Pro: mount your license file
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - qorstack-network
+
+  frontend:
+    image: qorstack/report-web:latest
+    container_name: qorstack-report-web
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # Must be a URL your *browser* can reach.
+      # Local:  http://localhost:8080
+      # Remote: http://<server-ip>:8080  or  https://api.yourdomain.com
+      - NEXT_PUBLIC_SERVICE=${API_URL:-http://localhost:8080}
+    depends_on:
+      - backend
+    networks:
+      - qorstack-network
+
+volumes:
+  postgres_data:
+  minio_data:
+  fonts_cache:
+
+networks:
+  qorstack-network:
+    driver: bridge
